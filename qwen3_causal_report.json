@@ -1,0 +1,18 @@
+{
+  "model_name": "Qwen/Qwen3-0.6B-Base",
+  "mode": "causal",
+  "device": "cpu",
+  "bidirectional": false,
+  "earlier_token_difference": 0.0,
+  "later_token_difference": 56.02027893066406,
+  "padding_invariant": true,
+  "padding_difference": 0.0,
+  "elapsed_seconds": 0.20801580001716502,
+  "peak_allocated_mb": null,
+  "peak_reserved_mb": null,
+  "output_shape": [
+    1,
+    9,
+    1024
+  ]
+}

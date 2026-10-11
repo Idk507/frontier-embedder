@@ -1,20 +1,20 @@
 
-"""Qwen3 backbone with bidirectional attention for embedding learning.
+"""Qwen3 bidirectional embedding backbone.
 
-Targets Hugging Face Transformers 4.57.3 with eager attention.
+Compatible with the eager-attention Qwen3 implementation in
+Transformers 4.57.3.
 
-Important:
-    The temporary mask override patches a module-level function.
-    Concurrent forward passes from other Qwen3 model instances in
-    the same Python process are not supported during the override.
+Uses instance-scoped forward pre-hooks rather than global
+monkey-patching.
+
+The implementation targets full-sequence embedding inference
+and training, not autoregressive generation or KV caching.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from threading import RLock
 from typing import Iterator
-from unittest.mock import patch
 
 import torch
 from torch import Tensor, nn
@@ -23,11 +23,8 @@ from transformers import AutoConfig, AutoModel
 from frontier_embedder.config import ModelConfig
 
 
-_MASK_PATCH_LOCK = RLock()
-
-
 class BidirectionalQwenBackbone(nn.Module):
-    """Qwen3 representation backbone with noncausal attention."""
+    """Qwen3 backbone with bidirectional self-attention."""
 
     def __init__(
         self,
@@ -40,7 +37,9 @@ class BidirectionalQwenBackbone(nn.Module):
         self.config = config
 
         hidden_size = getattr(
-            model.config, "hidden_size", None
+            model.config,
+            "hidden_size",
+            None,
         )
 
         if hidden_size != config.hidden_size:
@@ -49,12 +48,27 @@ class BidirectionalQwenBackbone(nn.Module):
                 f"received {hidden_size}"
             )
 
-        if getattr(
-            model.config, "_attn_implementation", None
-        ) != "eager":
+        implementation = getattr(
+            model.config,
+            "_attn_implementation",
+            None,
+        )
+
+        if implementation != "eager":
             raise ValueError(
-                "BidirectionalQwenBackbone currently "
-                "requires eager attention"
+                "BidirectionalQwenBackbone requires "
+                "eager attention"
+            )
+
+        model_type = getattr(
+            model.config,
+            "model_type",
+            None,
+        )
+
+        if model_type != "qwen3":
+            raise ValueError(
+                "Only Qwen3 models are supported"
             )
 
     @classmethod
@@ -68,6 +82,7 @@ class BidirectionalQwenBackbone(nn.Module):
         model_config = AutoConfig.from_pretrained(
             config.backbone_name,
             local_files_only=local_files_only,
+            trust_remote_code=False,
         )
 
         if model_config.model_type != "qwen3":
@@ -81,6 +96,7 @@ class BidirectionalQwenBackbone(nn.Module):
             dtype=dtype,
             local_files_only=local_files_only,
             attn_implementation="eager",
+            trust_remote_code=False,
         )
 
         return cls(model, config)
@@ -90,14 +106,12 @@ class BidirectionalQwenBackbone(nn.Module):
         attention_mask: Tensor,
         dtype: torch.dtype,
     ) -> Tensor:
-        """Construct a 4D additive padding-only attention mask.
+        """Return additive mask of shape [B, 1, T, T]."""
+        if attention_mask.ndim != 2:
+            raise ValueError(
+                "attention_mask must be [B, T]"
+            )
 
-        Shape: [B, 1, T, T]
-
-        Valid keys receive 0.
-        Padding keys receive the minimum finite dtype value.
-        No triangular causal restriction is applied.
-        """
         batch_size, seq_len = attention_mask.shape
 
         minimum = torch.finfo(dtype).min
@@ -120,38 +134,70 @@ class BidirectionalQwenBackbone(nn.Module):
             minimum,
         )
 
+    def _attention_modules(self) -> list[nn.Module]:
+        """Find attention layers owned by this model."""
+        from transformers.models.qwen3.modeling_qwen3 import (
+            Qwen3Attention,
+        )
+
+        modules = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, Qwen3Attention)
+        ]
+
+        if not modules:
+            raise RuntimeError(
+                "No Qwen3Attention modules found"
+            )
+
+        return modules
+
     @contextmanager
     def _bidirectional_attention(
         self,
         attention_mask: Tensor,
     ) -> Iterator[None]:
-        """Override Qwen3 model-level causal mask construction."""
-        from transformers.models.qwen3 import modeling_qwen3
+        """Install temporary, instance-local mask overrides."""
+        mask = self._build_bidirectional_mask(
+            attention_mask,
+            dtype=self.model.dtype,
+        )
 
-        if not hasattr(
-            modeling_qwen3, "create_causal_mask"
+        def replace_attention_mask(
+            module: nn.Module,
+            args: tuple,
+            kwargs: dict,
         ):
-            raise RuntimeError(
-                "Expected create_causal_mask was not found. "
-                "Check Transformers version and Qwen3 internals."
-            )
+            # Qwen3Attention receives attention_mask
+            # as a keyword argument in the supported
+            # Transformers implementation.
+            if "attention_mask" not in kwargs:
+                raise RuntimeError(
+                    "Qwen3 attention signature changed: "
+                    "attention_mask keyword missing"
+                )
 
-        def create_bidirectional_mask(*args, **kwargs):
-            return self._build_bidirectional_mask(
-                attention_mask=attention_mask,
-                dtype=self.model.dtype,
-            )
+            updated_kwargs = dict(kwargs)
+            updated_kwargs["attention_mask"] = mask
 
-        # This is a temporary compatibility approach.
-        # The lock serializes calls using this wrapper, but cannot
-        # protect unrelated Qwen3 instances outside the lock.
-        with _MASK_PATCH_LOCK:
-            with patch.object(
-                modeling_qwen3,
-                "create_causal_mask",
-                create_bidirectional_mask,
-            ):
-                yield
+            return args, updated_kwargs
+
+        handles = []
+
+        try:
+            for module in self._attention_modules():
+                handle = module.register_forward_pre_hook(
+                    replace_attention_mask,
+                    with_kwargs=True,
+                )
+                handles.append(handle)
+
+            yield
+
+        finally:
+            for handle in handles:
+                handle.remove()
 
     def forward(
         self,
@@ -160,12 +206,12 @@ class BidirectionalQwenBackbone(nn.Module):
     ) -> Tensor:
         if input_ids.ndim != 2:
             raise ValueError(
-                "input_ids must have shape [B, T]"
+                "input_ids must be [B, T]"
             )
 
         if attention_mask.shape != input_ids.shape:
             raise ValueError(
-                "attention_mask must match input_ids shape"
+                "attention_mask shape mismatch"
             )
 
         if input_ids.dtype not in (
@@ -173,18 +219,17 @@ class BidirectionalQwenBackbone(nn.Module):
             torch.int64,
         ):
             raise TypeError(
-                "input_ids must contain integer token IDs"
+                "input_ids must contain integer IDs"
             )
 
         if input_ids.device != attention_mask.device:
             raise ValueError(
-                "input_ids and attention_mask "
-                "must share a device"
+                "Input tensors must share a device"
             )
 
         if not torch.all(
-            (attention_mask == 0) |
-            (attention_mask == 1)
+            (attention_mask == 0)
+            | (attention_mask == 1)
         ):
             raise ValueError(
                 "attention_mask must be binary"
@@ -194,8 +239,7 @@ class BidirectionalQwenBackbone(nn.Module):
             attention_mask.sum(dim=1) == 0
         ):
             raise ValueError(
-                "Every sequence must contain "
-                "at least one valid token"
+                "Each sequence needs a valid token"
             )
 
         with self._bidirectional_attention(
