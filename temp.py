@@ -1,44 +1,56 @@
 
-"""Dense pooling and Matryoshka embedding utilities."""
+"""Trainable token-level embedding heads.
+
+Provides a ColBERT-style multi-vector projection head for
+late-interaction retrieval.
+"""
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
- 
+
 from frontier_embedder.config import ModelConfig
 
 
-class DensePooling(nn.Module):
-    """Mask-aware mean pooling with optional L2 normalization."""
+class MultiVectorHead(nn.Module):
+    """Project contextual token states into compact token embeddings.
+
+    Input:
+        hidden_states: [batch, tokens, hidden_size]
+        attention_mask: [batch, tokens]
+
+    Output:
+        token_embeddings: [batch, tokens, multi_vector_dim]
+
+    Valid nonzero token vectors are L2-normalized.
+    Padding positions are exactly zero.
+    """
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
 
-        if config.dense_dim != config.hidden_size:
-            raise ValueError(
-                "DensePooling currently requires dense_dim == hidden_size. "
-                "A learned projection is needed for other dimensions."
-            )
-
         self.config = config
+
+        self.projection = nn.Linear(
+            in_features=config.hidden_size,
+            out_features=config.multi_vector_dim,
+            bias=False,
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize the projection with Xavier initialization."""
+        nn.init.xavier_uniform_(self.projection.weight)
 
     def forward(
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,
     ) -> Tensor:
-        """Convert token representations into document embeddings.
-
-        Args:
-            hidden_states: Tensor of shape [B, T, H].
-            attention_mask: Tensor of shape [B, T].
-                1 indicates a valid token; 0 indicates padding.
-
-        Returns:
-            Dense embeddings of shape [B, dense_dim].
-        """
+        """Produce masked, normalized token embeddings."""
         if hidden_states.ndim != 3:
             raise ValueError(
                 "hidden_states must have shape [B, T, H]"
@@ -62,10 +74,15 @@ class DensePooling(nn.Module):
                 "attention_mask must have shape [B, T]"
             )
 
-        if attention_mask.device != hidden_states.device:
+        if hidden_states.device != attention_mask.device:
             raise ValueError(
-                "attention_mask and hidden_states must "
+                "hidden_states and attention_mask must "
                 "be on the same device"
+            )
+
+        if not hidden_states.is_floating_point():
+            raise TypeError(
+                "hidden_states must be a floating-point tensor"
             )
 
         if not torch.all(
@@ -75,77 +92,25 @@ class DensePooling(nn.Module):
                 "attention_mask must contain only 0 and 1"
             )
 
-        valid_counts = attention_mask.sum(dim=1)
-
-        if torch.any(valid_counts == 0):
+        # A document with no valid tokens should be rejected.
+        if torch.any(attention_mask.sum(dim=1) == 0):
             raise ValueError(
                 "Each input must contain at least one valid token"
             )
 
-        mask = attention_mask.unsqueeze(-1).to(
-            dtype=hidden_states.dtype
+        # Learned shared token projection.
+        projected = self.projection(hidden_states)
+
+        # Normalize in float32 for numerical stability.
+        normalized = F.normalize(
+            projected.float(),
+            p=2,
+            dim=-1,
         )
 
-        masked_states = hidden_states * mask
-        summed = masked_states.sum(dim=1)
+        # Zero padding positions after projection and normalization.
+        mask = attention_mask.unsqueeze(-1).to(
+            dtype=normalized.dtype
+        )
 
-        counts = mask.sum(dim=1).clamp(min=1)
-        embeddings = summed / counts
-
-        if self.config.normalize_embeddings:
-            embeddings = F.normalize(
-                embeddings.float(),
-                p=2,
-                dim=-1,
-            )
-
-        return embeddings
-
-
-class MatryoshkaEmbedding(nn.Module):
-    """Extract normalized prefix embeddings at configured dimensions."""
-
-    def __init__(self, config: ModelConfig) -> None:
-        super().__init__()
-        self.config = config
-
-    def forward(
-        self,
-        embeddings: Tensor,
-        dimensions: int | None = None,
-    ) -> Tensor | dict[int, Tensor]:
-        """Return one prefix or all configured Matryoshka prefixes.
-
-        A prefix is normalized independently after truncation.
-        """
-        if embeddings.ndim != 2:
-            raise ValueError(
-                "embeddings must have shape [B, dense_dim]"
-            )
-
-        if embeddings.shape[-1] != self.config.dense_dim:
-            raise ValueError(
-                f"Expected dense dimension {self.config.dense_dim}, "
-                f"received {embeddings.shape[-1]}"
-            )
-
-        if dimensions is not None:
-            if dimensions not in self.config.matryoshka_dims:
-                raise ValueError(
-                    f"Unsupported dimension: {dimensions}"
-                )
-
-            return F.normalize(
-                embeddings[:, :dimensions].float(),
-                p=2,
-                dim=-1,
-            )
-
-        return {
-            dim: F.normalize(
-                embeddings[:, :dim].float(),
-                p=2,
-                dim=-1,
-            )
-            for dim in self.config.matryoshka_dims
-        }
+        return normalized * mask
